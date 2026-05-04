@@ -5,11 +5,11 @@ RUN apt-get update && apt-get install -y gcc make python3
 WORKDIR /app
 COPY . /app
 
-# Run preprocessing to generate dataset_uint8.bin
+# Run preprocessing
 RUN python3 preprocess.py
 
-# Compile API with AVX2 and fast math for optimal distance calculation
-RUN gcc -O3 -march=x86-64-v3 -ffast-math -flto -o api src/main.c src/mongoose.c src/cJSON.c -lm
+# Compile API
+RUN gcc -O3 -march=x86-64-v3 -ffast-math -flto -DMG_ENABLE_EPOLL=1 -DMG_ENABLE_LOG=0 -o api src/main.c src/mongoose.c src/cJSON.c -lm
 
 FROM ubuntu:24.04
 WORKDIR /app

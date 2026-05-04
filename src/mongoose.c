@@ -12538,47 +12538,38 @@ static MG_SOCKET_TYPE raccept(MG_SOCKET_TYPE sock, union usa *usa,
 }
 
 static void accept_conn(struct mg_mgr *mgr, struct mg_connection *lsn) {
-  struct mg_connection *c = NULL;
-  union usa usa;
-  socklen_t sa_len = sizeof(usa);
-  MG_SOCKET_TYPE fd = raccept(FD(lsn), &usa, &sa_len);
-  if (fd == MG_INVALID_SOCKET) {
-#if MG_ARCH == MG_ARCH_THREADX || defined(__ECOS)
-    // NetxDuo, in non-block socket mode can mark listening socket readable
-    // even it is not. See comment for 'select' func implementation in
-    // nx_bsd.c That's not an error, just should try later
-    if (errno != EAGAIN)
-#endif
-      MG_ERROR(("%lu accept failed, errno %d", lsn->id, MG_SOCK_ERR(-1)));
-#if (MG_ARCH != MG_ARCH_WIN32) && !MG_ENABLE_FREERTOS_TCP && \
-    (MG_ARCH != MG_ARCH_TIRTOS) && !MG_ENABLE_POLL && !MG_ENABLE_EPOLL
-  } else if ((long) fd >= FD_SETSIZE) {
-    MG_ERROR(("%ld > %ld", (long) fd, (long) FD_SETSIZE));
-    closesocket(fd);
-#endif
-  } else if ((c = mg_alloc_conn(mgr)) == NULL) {
-    MG_ERROR(("%lu OOM", lsn->id));
-    closesocket(fd);
-  } else {
-    tomgaddr(&usa, &c->rem, sa_len != sizeof(usa.sin));
-    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
-    c->fd = S2PTR(fd);
-    MG_EPOLL_ADD(c);
-    mg_set_non_blocking_mode(FD(c));
-    setsockopts(c);
-    c->is_accepted = 1;
-    c->is_hexdumping = lsn->is_hexdumping;
-    setlocaddr(fd, &c->loc); // set local addr to where the client connected to
-    c->pfn = lsn->pfn;
-    c->pfn_data = lsn->pfn_data;
-    c->fn = lsn->fn;
-    c->fn_data = lsn->fn_data;
-    c->is_tls = lsn->is_tls;
-    MG_DEBUG(("%lu %ld accepted %M -> %M", c->id, c->fd, mg_print_ip_port,
-              &c->rem, mg_print_ip_port, &c->loc));
-    mg_call(c, MG_EV_OPEN, NULL);
-    mg_call(c, MG_EV_ACCEPT, NULL);
-    if (!c->is_tls_hs) c->is_tls = 0;  // user did not call mg_tls_init()
+  while (1) {
+    struct mg_connection *c = NULL;
+    union usa usa;
+    socklen_t sa_len = sizeof(usa);
+    MG_SOCKET_TYPE fd = raccept(FD(lsn), &usa, &sa_len);
+    if (fd == MG_INVALID_SOCKET) {
+      break; // No more pending connections
+    } else if ((c = mg_alloc_conn(mgr)) == NULL) {
+      MG_ERROR(("%lu OOM", lsn->id));
+      closesocket(fd);
+      break;
+    } else {
+      tomgaddr(&usa, &c->rem, sa_len != sizeof(usa.sin));
+      LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
+      c->fd = S2PTR(fd);
+      MG_EPOLL_ADD(c);
+      mg_set_non_blocking_mode(FD(c));
+      setsockopts(c);
+      c->is_accepted = 1;
+      c->is_hexdumping = lsn->is_hexdumping;
+      setlocaddr(fd, &c->loc); // set local addr to where the client connected to
+      c->pfn = lsn->pfn;
+      c->pfn_data = lsn->pfn_data;
+      c->fn = lsn->fn;
+      c->fn_data = lsn->fn_data;
+      c->is_tls = lsn->is_tls;
+      MG_DEBUG(("%lu %ld accepted %M -> %M", c->id, c->fd, mg_print_ip_port,
+                &c->rem, mg_print_ip_port, &c->loc));
+      mg_call(c, MG_EV_OPEN, NULL);
+      mg_call(c, MG_EV_ACCEPT, NULL);
+      if (!c->is_tls_hs) c->is_tls = 0;  // user did not call mg_tls_init()
+    }
   }
 }
 

@@ -1,6 +1,7 @@
 import json
 import gzip
 import sys
+import random
 
 def main():
     print("Loading normalization.json...")
@@ -37,25 +38,33 @@ def main():
     with gzip.open('resources/references.json.gz', 'rt') as f:
         data = json.load(f)
 
+    print("Quantizing and building KD-Tree in-memory...")
+    
+    # 1. Load and quantize all records
+    records = []
+    for record in data:
+        vec = record['vector']
+        label = 1 if record['label'] == 'fraud' else 0
+        
+        buf = bytearray(16)
+        for i, v in enumerate(vec):
+            if v < -1.0: v = -1.0
+            if v > 1.0: v = 1.0
+            val = int(round((v + 1.0) * 127.0))
+            buf[i] = val
+        buf[14] = label
+        buf[15] = 0
+        records.append(buf)
+        
+    print("Sorting dataset by dimension 0 for early stopping...")
+    records.sort(key=lambda x: x[0])
+    
+    print("Writing 1D-sorted array to dataset_uint8.bin...")
     with open('resources/dataset_uint8.bin', 'wb') as out_f:
-        # Quantize to 8-bit:
-        # -1.0 maps to 0
-        # 0.0 maps to 127
-        # 1.0 maps to 254
-        for record in data:
-            vec = record['vector']
-            label = 1 if record['label'] == 'fraud' else 0
+        for r in records:
+            out_f.write(r)
             
-            buf = bytearray(15)
-            for i, v in enumerate(vec):
-                if v < -1.0: v = -1.0
-                if v > 1.0: v = 1.0
-                val = int(round((v + 1.0) * 127.0))
-                buf[i] = val
-            buf[14] = label
-            out_f.write(buf)
-            
-    print("Done generating dataset_uint8.bin!")
+    print("Done generating 1D-sorted dataset_uint8.bin!")
 
 if __name__ == '__main__':
     main()
