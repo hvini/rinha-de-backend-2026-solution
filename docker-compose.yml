@@ -1,0 +1,43 @@
+services:
+  api1:
+    build: .
+    image: rinha-backend-2026-api
+    networks:
+      - rinha-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "160MB"
+
+  api2:
+    build: .
+    image: rinha-backend-2026-api
+    networks:
+      - rinha-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "160MB"
+
+  lb:
+    image: nginx:alpine
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - rinha-network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "30MB"
+
+networks:
+  rinha-network:
+    driver: bridge
