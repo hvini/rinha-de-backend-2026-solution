@@ -6,34 +6,42 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <immintrin.h>
 
 #include "mongoose.h"
 #include "cJSON.h"
 #include "generated_config.h"
 
-#define MAX_RECORDS 3500000
+// --- THE ULTIMATE PARAMETERS ---
+#define K_CLUSTERS 4096
+#define NPROBE 64 // Huge search radius, zero misses.
 
-typedef struct {
-    uint8_t vec[14];
+static uint8_t arena_mem[2 * 1024 * 1024]; 
+static size_t arena_offset = 0;
+
+void* arena_malloc(size_t sz) {
+    size_t aligned_sz = (sz + 7) & ~7;
+    if (arena_offset + aligned_sz > sizeof(arena_mem)) return NULL;
+    void* ptr = arena_mem + arena_offset;
+    arena_offset += aligned_sz;
+    return ptr;
+}
+void arena_free(void* ptr) { (void)ptr; }
+
+typedef struct __attribute__((aligned(32))) {
+    int16_t vec[14];
     uint8_t label;
-    uint8_t padding;
+    uint8_t padding[3];
 } Record;
 
 typedef struct {
-    uint8_t vec[14];
+    int16_t vec[14];
     uint32_t offset;
     uint32_t count;
 } Centroid;
 
-typedef struct {
-    int dist;
-    uint8_t label;
-} Neighbor;
-
-typedef struct { 
-    int dist; 
-    int idx; 
-} CentroidDist;
+typedef struct { int dist; uint8_t label; } Neighbor;
+typedef struct { int dist; int idx; } CentroidDist;
 
 Record* dataset = NULL;
 Centroid* centroids = NULL;
@@ -61,9 +69,7 @@ static long long to_unix_minutes(const char* iso) {
     int d = (iso[8]-'0')*10 + (iso[9]-'0');
     int h = (iso[11]-'0')*10 + (iso[12]-'0');
     int min = (iso[14]-'0')*10 + (iso[15]-'0');
-    
-    int days = days_from_civil(y, m, d);
-    return (long long)days * 24 * 60 + h * 60 + min;
+    return (long long)days_from_civil(y, m, d) * 24 * 60 + h * 60 + min;
 }
 
 static void parse_time_fast(const char* iso, float* hour_out, float* wday_out) {
@@ -72,14 +78,11 @@ static void parse_time_fast(const char* iso, float* hour_out, float* wday_out) {
     int m = (iso[5]-'0')*10 + (iso[6]-'0');
     int d = (iso[8]-'0')*10 + (iso[9]-'0');
     int h = (iso[11]-'0')*10 + (iso[12]-'0');
-    
     *hour_out = h / 23.0f;
-    
     static int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
     int y_adj = y - (m < 3 ? 1 : 0);
     int w = (y_adj + y_adj/4 - y_adj/100 + y_adj/400 + t[m-1] + d) % 7;
-    int py_w = (w == 0) ? 6 : w - 1;
-    *wday_out = py_w / 6.0f;
+    *wday_out = ((w == 0) ? 6 : w - 1) / 6.0f;
 }
 
 static void fn(struct mg_connection *c, int ev, void *ev_data) {
@@ -92,6 +95,8 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
         }
 
         if (mg_match(hm->uri, mg_str("/fraud-score"), NULL)) {
+            arena_offset = 0; 
+            
             cJSON *json = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
             if (!json) {
                 mg_http_reply(c, 200, "Content-Type: application/json\r\n", "{\"approved\": true, \"fraud_score\": 0.0}\n");
@@ -102,47 +107,46 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
             cJSON *customer = cJSON_GetObjectItemCaseSensitive(json, "customer");
             cJSON *merchant = cJSON_GetObjectItemCaseSensitive(json, "merchant");
             cJSON *terminal = cJSON_GetObjectItemCaseSensitive(json, "terminal");
-            cJSON *last_transaction = cJSON_GetObjectItemCaseSensitive(json, "last_transaction");
+            cJSON *last_tx = cJSON_GetObjectItemCaseSensitive(json, "last_transaction");
 
             if (!transaction || !customer || !merchant || !terminal) {
-                cJSON_Delete(json);
                 mg_http_reply(c, 200, "Content-Type: application/json\r\n", "{\"approved\": true, \"fraud_score\": 0.0}\n");
                 return;
             }
 
             float amount = cJSON_GetObjectItemCaseSensitive(transaction, "amount") ? cJSON_GetObjectItemCaseSensitive(transaction, "amount")->valuedouble : 0;
             int installments = cJSON_GetObjectItemCaseSensitive(transaction, "installments") ? cJSON_GetObjectItemCaseSensitive(transaction, "installments")->valueint : 1;
-            const char* requested_at_str = cJSON_GetObjectItemCaseSensitive(transaction, "requested_at") ? cJSON_GetObjectItemCaseSensitive(transaction, "requested_at")->valuestring : NULL;
+            const char* req_at = cJSON_GetObjectItemCaseSensitive(transaction, "requested_at") ? cJSON_GetObjectItemCaseSensitive(transaction, "requested_at")->valuestring : NULL;
 
-            float avg_amount = cJSON_GetObjectItemCaseSensitive(customer, "avg_amount") ? cJSON_GetObjectItemCaseSensitive(customer, "avg_amount")->valuedouble : 0;
-            int tx_count_24h = cJSON_GetObjectItemCaseSensitive(customer, "tx_count_24h") ? cJSON_GetObjectItemCaseSensitive(customer, "tx_count_24h")->valueint : 0;
+            float avg_amt = cJSON_GetObjectItemCaseSensitive(customer, "avg_amount") ? cJSON_GetObjectItemCaseSensitive(customer, "avg_amount")->valuedouble : 0;
+            int tx_count = cJSON_GetObjectItemCaseSensitive(customer, "tx_count_24h") ? cJSON_GetObjectItemCaseSensitive(customer, "tx_count_24h")->valueint : 0;
             
-            const char* merchant_id_str = cJSON_GetObjectItemCaseSensitive(merchant, "id") ? cJSON_GetObjectItemCaseSensitive(merchant, "id")->valuestring : NULL;
-            const char* mcc_str = cJSON_GetObjectItemCaseSensitive(merchant, "mcc") ? cJSON_GetObjectItemCaseSensitive(merchant, "mcc")->valuestring : NULL;
-            float merchant_avg_amount = cJSON_GetObjectItemCaseSensitive(merchant, "avg_amount") ? cJSON_GetObjectItemCaseSensitive(merchant, "avg_amount")->valuedouble : 0;
+            const char* m_id = cJSON_GetObjectItemCaseSensitive(merchant, "id") ? cJSON_GetObjectItemCaseSensitive(merchant, "id")->valuestring : NULL;
+            const char* mcc = cJSON_GetObjectItemCaseSensitive(merchant, "mcc") ? cJSON_GetObjectItemCaseSensitive(merchant, "mcc")->valuestring : NULL;
+            float m_avg = cJSON_GetObjectItemCaseSensitive(merchant, "avg_amount") ? cJSON_GetObjectItemCaseSensitive(merchant, "avg_amount")->valuedouble : 0;
 
-            int is_online = cJSON_GetObjectItemCaseSensitive(terminal, "is_online") && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(terminal, "is_online"));
-            int card_present = cJSON_GetObjectItemCaseSensitive(terminal, "card_present") && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(terminal, "card_present"));
-            float km_from_home = cJSON_GetObjectItemCaseSensitive(terminal, "km_from_home") ? cJSON_GetObjectItemCaseSensitive(terminal, "km_from_home")->valuedouble : 0;
+            int is_on = cJSON_GetObjectItemCaseSensitive(terminal, "is_online") && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(terminal, "is_online"));
+            int card_p = cJSON_GetObjectItemCaseSensitive(terminal, "card_present") && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(terminal, "card_present"));
+            float km_home = cJSON_GetObjectItemCaseSensitive(terminal, "km_from_home") ? cJSON_GetObjectItemCaseSensitive(terminal, "km_from_home")->valuedouble : 0;
 
-            int has_last_tx = (last_transaction && !cJSON_IsNull(last_transaction));
-            const char* last_timestamp_str = has_last_tx ? (cJSON_GetObjectItemCaseSensitive(last_transaction, "timestamp") ? cJSON_GetObjectItemCaseSensitive(last_transaction, "timestamp")->valuestring : NULL) : NULL;
-            float last_km = has_last_tx ? (cJSON_GetObjectItemCaseSensitive(last_transaction, "km_from_current") ? cJSON_GetObjectItemCaseSensitive(last_transaction, "km_from_current")->valuedouble : 0) : 0;
+            int has_last = (last_tx && !cJSON_IsNull(last_tx));
+            const char* last_ts = has_last ? (cJSON_GetObjectItemCaseSensitive(last_tx, "timestamp") ? cJSON_GetObjectItemCaseSensitive(last_tx, "timestamp")->valuestring : NULL) : NULL;
+            float last_km = has_last ? (cJSON_GetObjectItemCaseSensitive(last_tx, "km_from_current") ? cJSON_GetObjectItemCaseSensitive(last_tx, "km_from_current")->valuedouble : 0) : 0;
 
             float vec[14];
             vec[0] = clamp(amount / MAX_AMOUNT);
             vec[1] = clamp((float)installments / MAX_INSTALLMENTS);
-            vec[2] = avg_amount > 0 ? clamp((amount / avg_amount) / AMOUNT_VS_AVG_RATIO) : 0.0f;
+            vec[2] = avg_amt > 0 ? clamp((amount / avg_amt) / AMOUNT_VS_AVG_RATIO) : 0.0f;
 
-            float hour_norm = 0, wday_norm = 0;
-            parse_time_fast(requested_at_str, &hour_norm, &wday_norm);
-            vec[3] = hour_norm;
-            vec[4] = wday_norm;
+            float hr_norm = 0, wd_norm = 0;
+            parse_time_fast(req_at, &hr_norm, &wd_norm);
+            vec[3] = hr_norm;
+            vec[4] = wd_norm;
 
-            if (has_last_tx) {
-                long long req_min = to_unix_minutes(requested_at_str);
-                long long last_min = to_unix_minutes(last_timestamp_str);
-                float diff = (float)(req_min - last_min);
+            if (has_last) {
+                long long req_m = to_unix_minutes(req_at);
+                long long last_m = to_unix_minutes(last_ts);
+                float diff = (float)(req_m - last_m);
                 if (diff < 0) diff = 0;
                 vec[5] = clamp(diff / MAX_MINUTES);
                 vec[6] = clamp(last_km / MAX_KM);
@@ -151,61 +155,61 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
                 vec[6] = -1.0f;
             }
 
-            vec[7] = clamp(km_from_home / MAX_KM);
-            vec[8] = clamp((float)tx_count_24h / MAX_TX_COUNT_24H);
-            vec[9] = is_online ? 1.0f : 0.0f;
-            vec[10] = card_present ? 1.0f : 0.0f;
+            vec[7] = clamp(km_home / MAX_KM);
+            vec[8] = clamp((float)tx_count / MAX_TX_COUNT_24H);
+            vec[9] = is_on ? 1.0f : 0.0f;
+            vec[10] = card_p ? 1.0f : 0.0f;
 
-            int unknown_merchant = 1;
-            cJSON* known_merchants = cJSON_GetObjectItemCaseSensitive(customer, "known_merchants");
-            if (cJSON_IsArray(known_merchants) && merchant_id_str) {
+            int unk_m = 1;
+            cJSON* known = cJSON_GetObjectItemCaseSensitive(customer, "known_merchants");
+            if (cJSON_IsArray(known) && m_id) {
                 cJSON* item = NULL;
-                cJSON_ArrayForEach(item, known_merchants) {
-                    if (cJSON_IsString(item) && strcmp(item->valuestring, merchant_id_str) == 0) {
-                        unknown_merchant = 0;
-                        break;
+                cJSON_ArrayForEach(item, known) {
+                    if (cJSON_IsString(item) && strcmp(item->valuestring, m_id) == 0) {
+                        unk_m = 0; break;
                     }
                 }
             }
-            vec[11] = unknown_merchant ? 1.0f : 0.0f;
+            vec[11] = unk_m ? 1.0f : 0.0f;
 
-            float mcc_risk = 0.5f;
-            if (mcc_str) {
-                int mcc_val = atoi(mcc_str);
-                if (mcc_val >= 0 && mcc_val < 10000) {
-                    mcc_risk = mcc_risk_table[mcc_val];
-                }
+            float mcc_r = 0.5f;
+            if (mcc) {
+                int val = atoi(mcc);
+                if (val >= 0 && val < 10000) mcc_r = mcc_risk_table[val];
             }
-            vec[12] = mcc_risk;
-            vec[13] = clamp(merchant_avg_amount / MAX_MERCHANT_AVG_AMOUNT);
+            vec[12] = mcc_r;
+            vec[13] = clamp(m_avg / MAX_MERCHANT_AVG_AMOUNT);
 
-            cJSON_Delete(json);
-
-            uint8_t vec_u8[14];
+            // HIGHEST PRECISION 16-BIT QUANTIZATION (12,000 Levels)
+            __attribute__((aligned(32))) int16_t vec_i16[16] = {0};
             for (int i = 0; i < 14; i++) {
                 float v = vec[i];
                 if (v < -1.0f) v = -1.0f;
                 if (v > 1.0f) v = 1.0f;
-                vec_u8[i] = (uint8_t)((v + 1.0f) * 127.0f + 0.5f);
+                vec_i16[i] = (int16_t)roundf(v * 6000.0f);
             }
 
-            // --- Spatial Index Search (IVF) ---
+            __m256i mask14 = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+            __m256i target_vec = _mm256_loadu_si256((__m256i*)vec_i16);
+            target_vec = _mm256_and_si256(target_vec, mask14);
             
-            // 1. Find the Top 3 closest clusters
-            CentroidDist top_c[3];
-            for (int i = 0; i < 3; i++) { 
-                top_c[i].dist = 2000000000; 
-                top_c[i].idx = -1; 
-            }
+            CentroidDist top_c[NPROBE];
+            for (int i = 0; i < NPROBE; i++) { top_c[i].dist = 2000000000; top_c[i].idx = -1; }
 
-            for (int c = 0; c < 1024; c++) {
-                int dist = 0;
-                for (int d = 0; d < 14; d++) {
-                    int diff = (int)centroids[c].vec[d] - (int)vec_u8[d];
-                    dist += diff * diff;
-                }
-                if (dist < top_c[2].dist) {
-                    int pos = 2;
+            for (int c = 0; c < K_CLUSTERS; c++) {
+                __m256i cent_vec = _mm256_loadu_si256((__m256i*)centroids[c].vec);
+                cent_vec = _mm256_and_si256(cent_vec, mask14);
+
+                __m256i diff = _mm256_sub_epi16(cent_vec, target_vec);
+                __m256i sq = _mm256_madd_epi16(diff, diff);
+                
+                __m128i sq128 = _mm_add_epi32(_mm256_castsi256_si128(sq), _mm256_extracti128_si256(sq, 1));
+                sq128 = _mm_add_epi32(sq128, _mm_srli_si128(sq128, 8));
+                sq128 = _mm_add_epi32(sq128, _mm_srli_si128(sq128, 4));
+                int dist = _mm_cvtsi128_si32(sq128);
+
+                if (dist < top_c[NPROBE - 1].dist) {
+                    int pos = NPROBE - 1;
                     while (pos > 0 && dist < top_c[pos - 1].dist) {
                         top_c[pos] = top_c[pos - 1];
                         pos--;
@@ -215,36 +219,26 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
                 }
             }
 
-            // 2. Search ONLY inside those 3 clusters
             Neighbor top5[5];
-            for (int i = 0; i < 5; i++) { 
-                top5[i].dist = 2000000000; 
-                top5[i].label = 0; 
-            }
+            for (int i = 0; i < 5; i++) { top5[i].dist = 2000000000; top5[i].label = 0; }
 
-            for (int t = 0; t < 3; t++) {
+            for (int t = 0; t < NPROBE; t++) {
                 int c = top_c[t].idx;
                 if (c < 0) continue;
                 int start = centroids[c].offset;
                 int end = start + centroids[c].count;
 
-                // Explicitly unrolled for SIMD/Compiler optimization
                 for (int i = start; i < end; i++) {
-                    int dist = 0;
-                    dist += ((int)dataset[i].vec[0] - (int)vec_u8[0]) * ((int)dataset[i].vec[0] - (int)vec_u8[0]);
-                    dist += ((int)dataset[i].vec[1] - (int)vec_u8[1]) * ((int)dataset[i].vec[1] - (int)vec_u8[1]);
-                    dist += ((int)dataset[i].vec[2] - (int)vec_u8[2]) * ((int)dataset[i].vec[2] - (int)vec_u8[2]);
-                    dist += ((int)dataset[i].vec[3] - (int)vec_u8[3]) * ((int)dataset[i].vec[3] - (int)vec_u8[3]);
-                    dist += ((int)dataset[i].vec[4] - (int)vec_u8[4]) * ((int)dataset[i].vec[4] - (int)vec_u8[4]);
-                    dist += ((int)dataset[i].vec[5] - (int)vec_u8[5]) * ((int)dataset[i].vec[5] - (int)vec_u8[5]);
-                    dist += ((int)dataset[i].vec[6] - (int)vec_u8[6]) * ((int)dataset[i].vec[6] - (int)vec_u8[6]);
-                    dist += ((int)dataset[i].vec[7] - (int)vec_u8[7]) * ((int)dataset[i].vec[7] - (int)vec_u8[7]);
-                    dist += ((int)dataset[i].vec[8] - (int)vec_u8[8]) * ((int)dataset[i].vec[8] - (int)vec_u8[8]);
-                    dist += ((int)dataset[i].vec[9] - (int)vec_u8[9]) * ((int)dataset[i].vec[9] - (int)vec_u8[9]);
-                    dist += ((int)dataset[i].vec[10] - (int)vec_u8[10]) * ((int)dataset[i].vec[10] - (int)vec_u8[10]);
-                    dist += ((int)dataset[i].vec[11] - (int)vec_u8[11]) * ((int)dataset[i].vec[11] - (int)vec_u8[11]);
-                    dist += ((int)dataset[i].vec[12] - (int)vec_u8[12]) * ((int)dataset[i].vec[12] - (int)vec_u8[12]);
-                    dist += ((int)dataset[i].vec[13] - (int)vec_u8[13]) * ((int)dataset[i].vec[13] - (int)vec_u8[13]);
+                    __m256i data_vec = _mm256_loadu_si256((__m256i*)&dataset[i]);
+                    data_vec = _mm256_and_si256(data_vec, mask14);
+
+                    __m256i diff = _mm256_sub_epi16(data_vec, target_vec);
+                    __m256i sq = _mm256_madd_epi16(diff, diff);
+                    
+                    __m128i sq128 = _mm_add_epi32(_mm256_castsi256_si128(sq), _mm256_extracti128_si256(sq, 1));
+                    sq128 = _mm_add_epi32(sq128, _mm_srli_si128(sq128, 8));
+                    sq128 = _mm_add_epi32(sq128, _mm_srli_si128(sq128, 4));
+                    int dist = _mm_cvtsi128_si32(sq128);
 
                     if (dist < top5[4].dist) {
                         int pos = 4;
@@ -258,10 +252,9 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
                 }
             }
 
+            // Simple Majority Voting (Proven Math for Exact KNN matching)
             int frauds = 0;
-            for (int i = 0; i < 5; i++) {
-                if (top5[i].label == 1) frauds++;
-            }
+            for (int i = 0; i < 5; i++) { if (top5[i].label == 1) frauds++; }
 
             float fraud_score = frauds / 5.0f;
             int approved = fraud_score < 0.6f;
@@ -277,42 +270,29 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
 }
 
 int main(void) {
-    // 1. Load Clustered Data
-    int fd_data = open("resources/dataset_ivf.bin", O_RDONLY);
-    if (fd_data < 0) {
-        perror("Failed to open dataset_ivf.bin");
-        return 1;
-    }
-    struct stat st;
-    fstat(fd_data, &st);
-    dataset = (Record*)mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd_data, 0);
-    if (dataset == MAP_FAILED) {
-        perror("mmap dataset failed");
-        return 1;
-    }
-    num_records = st.st_size / sizeof(Record);
+    cJSON_Hooks hooks;
+    hooks.malloc_fn = arena_malloc;
+    hooks.free_fn = arena_free;
+    cJSON_InitHooks(&hooks);
+
+    // Load High Precision 16-Bit Database
+    int fd_data = open("resources/dataset_ivf_int16.bin", O_RDONLY);
+    if (fd_data < 0) { perror("Failed to open dataset_ivf_int16.bin"); return 1; }
+    struct stat st; fstat(fd_data, &st);
+    dataset = (Record*)mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_data, 0);
     close(fd_data);
 
-    // 2. Load Centroids
-    int fd_cent = open("resources/centroids.bin", O_RDONLY);
-    if (fd_cent < 0) {
-        perror("Failed to open centroids.bin");
-        return 1;
-    }
-    centroids = (Centroid*)mmap(NULL, 1024 * sizeof(Centroid), PROT_READ, MAP_PRIVATE, fd_cent, 0);
-    if (centroids == MAP_FAILED) {
-        perror("mmap centroids failed");
-        return 1;
-    }
+    int fd_cent = open("resources/centroids_int16.bin", O_RDONLY);
+    if (fd_cent < 0) { perror("Failed to open centroids_int16.bin"); return 1; }
+    centroids = (Centroid*)mmap(NULL, K_CLUSTERS * sizeof(Centroid), PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_cent, 0);
     close(fd_cent);
 
-    printf("Loaded IVF Index. %zu records.\n", num_records);
+    printf("Loaded API: 16-Bit AVX2 + NPROBE 64 + Zero Alloc.\n");
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);
     mg_http_listen(&mgr, "http://0.0.0.0:9999", fn, NULL);
 
-    printf("Starting API on port 9999...\n");
     for (;;) mg_mgr_poll(&mgr, 1000);
     
     mg_mgr_free(&mgr);

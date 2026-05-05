@@ -1,7 +1,6 @@
 import json
 import gzip
-import sys
-import random
+import struct
 
 def main():
     print("Loading normalization.json...")
@@ -29,42 +28,35 @@ def main():
             mcc_code = f"{i:04d}"
             risk = mcc.get(mcc_code, 0.5)
             f.write(f"    {risk}f,")
-            if i % 10 == 9:
-                f.write("\n")
+            if i % 10 == 9: f.write("\n")
         f.write("};\n\n")
         f.write("#endif\n")
 
-    print("Generating dataset_uint8.bin from references.json.gz...")
+    print("Generating High-Precision 16-Bit dataset...")
     with gzip.open('resources/references.json.gz', 'rt') as f:
         data = json.load(f)
-
-    print("Quantizing and building KD-Tree in-memory...")
     
-    # 1. Load and quantize all records
     records = []
     for record in data:
         vec = record['vector']
         label = 1 if record['label'] == 'fraud' else 0
         
-        buf = bytearray(16)
-        for i, v in enumerate(vec):
+        buf = bytearray()
+        for v in vec:
             if v < -1.0: v = -1.0
             if v > 1.0: v = 1.0
-            val = int(round((v + 1.0) * 127.0))
-            buf[i] = val
-        buf[14] = label
-        buf[15] = 0
+            # 12,000 levels of precision (prevents AVX2 overflow)
+            val = int(round(v * 6000.0))
+            buf += struct.pack('<h', val) # 16-bit signed integer
+            
+        buf += struct.pack('<B', label)
+        buf += b'\x00\x00\x00' # 3 bytes padding to reach exactly 32 bytes
         records.append(buf)
         
-    print("Sorting dataset by dimension 0 for early stopping...")
-    records.sort(key=lambda x: x[0])
-    
-    print("Writing 1D-sorted array to dataset_uint8.bin...")
-    with open('resources/dataset_uint8.bin', 'wb') as out_f:
-        for r in records:
-            out_f.write(r)
+    with open('resources/dataset_int16.bin', 'wb') as out_f:
+        for r in records: out_f.write(r)
             
-    print("Done generating 1D-sorted dataset_uint8.bin!")
+    print("Done! Output fits perfectly inside RAM limits.")
 
 if __name__ == '__main__':
     main()
