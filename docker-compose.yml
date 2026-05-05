@@ -1,23 +1,23 @@
 services:
   api1:
-    image: vhpcavalcanti/rinha-backend-2026-api:0.0.1
+    image: vhpcavalcanti/rinha-backend-2026-api:0.0.2
     networks:
       - rinha-network
     deploy:
       resources:
         limits:
           cpus: "0.4"
-          memory: "80MB"
+          memory: "160MB"
 
   api2:
-    image: vhpcavalcanti/rinha-backend-2026-api:0.0.1
+    image: vhpcavalcanti/rinha-backend-2026-api:0.0.2
     networks:
       - rinha-network
     deploy:
       resources:
         limits:
           cpus: "0.4"
-          memory: "80MB"
+          memory: "160MB"
 
   lb:
     image: nginx:alpine
@@ -34,7 +34,7 @@ services:
       resources:
         limits:
           cpus: "0.2"
-          memory: "190MB"
+          memory: "30MB"
 
 networks:
   rinha-network:
