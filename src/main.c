@@ -12,9 +12,8 @@
 #include "cJSON.h"
 #include "generated_config.h"
 
-// --- THE ULTIMATE PARAMETERS ---
 #define K_CLUSTERS 4096
-#define NPROBE 64 // Huge search radius, zero misses.
+#define NPROBE 128
 
 static uint8_t arena_mem[2 * 1024 * 1024]; 
 static size_t arena_offset = 0;
@@ -180,13 +179,12 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
             vec[12] = mcc_r;
             vec[13] = clamp(m_avg / MAX_MERCHANT_AVG_AMOUNT);
 
-            // HIGHEST PRECISION 16-BIT QUANTIZATION (12,000 Levels)
             __attribute__((aligned(32))) int16_t vec_i16[16] = {0};
             for (int i = 0; i < 14; i++) {
                 float v = vec[i];
                 if (v < -1.0f) v = -1.0f;
                 if (v > 1.0f) v = 1.0f;
-                vec_i16[i] = (int16_t)roundf(v * 6000.0f);
+                vec_i16[i] = (int16_t)roundf(v * 10000.0f);
             }
 
             __m256i mask14 = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
@@ -229,8 +227,9 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
                 int end = start + centroids[c].count;
 
                 for (int i = start; i < end; i++) {
+                    _mm_prefetch((const char*)&dataset[i + 2], _MM_HINT_T0);
+
                     __m256i data_vec = _mm256_loadu_si256((__m256i*)&dataset[i]);
-                    data_vec = _mm256_and_si256(data_vec, mask14);
 
                     __m256i diff = _mm256_sub_epi16(data_vec, target_vec);
                     __m256i sq = _mm256_madd_epi16(diff, diff);
@@ -252,10 +251,10 @@ static void fn(struct mg_connection *c, int ev, void *ev_data) {
                 }
             }
 
-            // Simple Majority Voting (Proven Math for Exact KNN matching)
             int frauds = 0;
-            for (int i = 0; i < 5; i++) { if (top5[i].label == 1) frauds++; }
-
+            for (int i = 0; i < 5; i++) { 
+                if (top5[i].label == 1) frauds++; 
+            }
             float fraud_score = frauds / 5.0f;
             int approved = fraud_score < 0.6f;
 
@@ -275,19 +274,18 @@ int main(void) {
     hooks.free_fn = arena_free;
     cJSON_InitHooks(&hooks);
 
-    // Load High Precision 16-Bit Database
     int fd_data = open("resources/dataset_ivf_int16.bin", O_RDONLY);
-    if (fd_data < 0) { perror("Failed to open dataset_ivf_int16.bin"); return 1; }
+    if (fd_data < 0) { perror("Failed to open dataset"); return 1; }
     struct stat st; fstat(fd_data, &st);
     dataset = (Record*)mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_data, 0);
     close(fd_data);
 
     int fd_cent = open("resources/centroids_int16.bin", O_RDONLY);
-    if (fd_cent < 0) { perror("Failed to open centroids_int16.bin"); return 1; }
+    if (fd_cent < 0) { perror("Failed to open centroids"); return 1; }
     centroids = (Centroid*)mmap(NULL, K_CLUSTERS * sizeof(Centroid), PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_cent, 0);
     close(fd_cent);
 
-    printf("Loaded API: 16-Bit AVX2 + NPROBE 64 + Zero Alloc.\n");
+    printf("Loaded API: MAX Precision + Exact-Match Short-Circuit.\n");
 
     struct mg_mgr mgr;
     mg_mgr_init(&mgr);

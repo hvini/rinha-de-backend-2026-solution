@@ -32,7 +32,7 @@ def main():
         f.write("};\n\n")
         f.write("#endif\n")
 
-    print("Generating High-Precision 16-Bit dataset...")
+    print("Generating Max-Precision 16-Bit dataset...")
     with gzip.open('resources/references.json.gz', 'rt') as f:
         data = json.load(f)
     
@@ -45,9 +45,8 @@ def main():
         for v in vec:
             if v < -1.0: v = -1.0
             if v > 1.0: v = 1.0
-            # 12,000 levels of precision (prevents AVX2 overflow)
-            val = int(round(v * 6000.0))
-            buf += struct.pack('<h', val) # 16-bit signed integer
+            val = int(round(v * 10000.0))
+            buf += struct.pack('<h', val)
             
         buf += struct.pack('<B', label)
         buf += b'\x00\x00\x00' # 3 bytes padding to reach exactly 32 bytes
@@ -56,7 +55,7 @@ def main():
     with open('resources/dataset_int16.bin', 'wb') as out_f:
         for r in records: out_f.write(r)
             
-    print("Done! Output fits perfectly inside RAM limits.")
+    print("Done! Output optimized for MAX AVX2 bounds.")
 
 if __name__ == '__main__':
     main()
