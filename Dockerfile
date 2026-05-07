@@ -12,7 +12,7 @@ RUN python3 preprocess.py
 RUN gcc -O3 -march=x86-64-v3 -ffast-math -flto -o build_index src/build_index.c && ./build_index
 
 # Compile API
-RUN gcc -O3 -march=x86-64-v3 -ffast-math -flto -DMG_ENABLE_EPOLL=1 -DMG_ENABLE_LOG=0 -o api src/main.c src/mongoose.c src/cJSON.c -lm
+RUN gcc -O3 -march=x86-64-v3 -ffast-math -flto -o api src/main.c -lm
 
 FROM ubuntu:24.04
 WORKDIR /app

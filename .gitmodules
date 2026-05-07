@@ -1,3 +1,6 @@
 [submodule "spec"]
 	path = spec
 	url = https://github.com/zanfranceschi/rinha-de-backend-2026
+[submodule "SoNoForevis"]
+	path = SoNoForevis
+	url = https://github.com/jairoblatt/SoNoForevis
