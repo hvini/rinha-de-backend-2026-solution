@@ -10,8 +10,6 @@ services:
         limits:
           cpus: "0.4"
           memory: "160MB"
-    security_opt:
-      - seccomp:unconfined
 
   api2:
     <<: *api
@@ -20,8 +18,6 @@ services:
 
   lb:
     image: vhpcavalcanti/so-no-forevis:0.0.1
-    security_opt:
-      - seccomp:unconfined
     environment:
       - PORT=9999
       - UPSTREAMS=/run/sock/api1.sock,/run/sock/api2.sock
